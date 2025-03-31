@@ -1,0 +1,26 @@
+prompt: "an animal."
+# prompt: "a stuffed tiger with blue eyes and a white background."
+steps: 10
+do_cit_injection: False
+# task: "preview_only"
+task: "smvd"
+# task: "cit"
+# preview: True
+latents_load: True
+
+mesh: "./dog.glb"
+mesh_app: "./tiger.glb"
+tex_app: "./tiger_texture.jpg"
+mtl_app: "./tiger.mtl"
+mesh_config_relative: True    # mesh is placed relative to the config file
+use_mesh_name: False
+cond_type: "depth"
+seed: 1
+mesh_scale: 1
+log_interval: 1
+tex_fast_preview: True
+view_fast_preview: True
+invert_with_controlnet: True
+bg_path: "./bg.png"
+latents_save_path: "./recons.pt"
+cond_app_path: "./cond_app.pt"

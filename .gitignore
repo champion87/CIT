@@ -3,3 +3,17 @@
 /assets/*.py
 /assets/*.mp4
 /data/MVD*/
+*.jpg
+src/__pycache__/*
+data/MVD_*
+src/SyncMVD/data/*
+*.err
+*.out
+*noisy_latents_*
+*.pyc
+export.sh
+holy_shit_that_works.png
+**/*.pt
+**/experiments/*/MVD*
+log/*
+results/lidor/*
