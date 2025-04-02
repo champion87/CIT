@@ -5,7 +5,7 @@ from datetime import datetime
 import torch
 from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
 from diffusers import DDPMScheduler, UniPCMultistepScheduler
-from src.pipeline import StableSyncMVDPipeline
+from src.modified_pipeline import StableSyncMVDPipeline
 from src.configs import *
 from shutil import copy
 

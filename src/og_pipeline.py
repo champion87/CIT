@@ -6,10 +6,10 @@ import numpy as np
 import math
 import random
 import torch
-import psutil
-import copy
 from torch import functional as F
 from torch import nn
+from torchvision.transforms import Compose, Resize, GaussianBlur, InterpolationMode
+
 from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
 from diffusers import DDPMScheduler, DDIMScheduler, UniPCMultistepScheduler
 from diffusers.models import AutoencoderKL, ControlNetModel, UNet2DConditionModel
@@ -32,23 +32,16 @@ from diffusers.utils import (
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers.models.attention_processor import Attention, AttentionProcessor
-from diffusers.training_utils import set_seed
 
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
-from project import UVProjection as UVP
-from uvp_utils import build_uvp, default_cameras, get_conditioning_images
+from .renderer.project import UVProjection as UVP
 
 
-from SyncMVD.src.syncmvd.attention import SamplewiseAttnProcessor2_0, replace_attention_processors
-from SyncMVD.src.syncmvd.prompt import *
-from SyncMVD.src.utils import *
+from .syncmvd.attention import SamplewiseAttnProcessor2_0, replace_attention_processors
+from .syncmvd.prompt import *
+from .syncmvd.step import step_tex
+from .utils import *
 
-from CIA.appearance_transfer_model import AppearanceTransferModel
-from cit_configs import Range, RunConfig
-from cit_utils import show_latents, show_views, save_all_views
-from cit_step import step_tex
-
-from datetime import datetime
 
 
 if torch.cuda.is_available():
@@ -66,7 +59,27 @@ color_constants = {"black": [-1, -1, -1], "white": [1, 1, 1], "maroon": [0, -1, 
 color_names = list(color_constants.keys())
 
 
+# Used to generate depth or normal conditioning images
+@torch.no_grad()
+def get_conditioning_images(uvp, output_size, render_size=512, blur_filter=5, cond_type="normal"):
+	verts, normals, depths, cos_maps, texels, fragments = uvp.render_geometry(image_size=render_size)
+	masks = normals[...,3][:,None,...]
+	masks = Resize((output_size//8,)*2, antialias=True)(masks)
+	normals_transforms = Compose([
+		Resize((output_size,)*2, interpolation=InterpolationMode.BILINEAR, antialias=True), 
+		GaussianBlur(blur_filter, blur_filter//3+1)]
+	)
 
+	if cond_type == "normal":
+		view_normals = uvp.decode_view_normal(normals).permute(0,3,1,2) *2 - 1
+		conditional_images = normals_transforms(view_normals)
+	# Some problem here, depth controlnet don't work when depth is normalized
+	# But it do generate using the unnormalized form as below
+	elif cond_type == "depth":
+		view_depths = uvp.decode_normalized_depth(depths).permute(0,3,1,2)
+		conditional_images = normals_transforms(view_depths)
+	
+	return conditional_images, masks
 
 
 # Revert time 0 background to time t to composite with time t foreground
@@ -86,7 +99,7 @@ def composite_rendered_view(scheduler, backgrounds, foregrounds, masks, t):
 
 # Split into micro-batches to use less memory in each unet prediction
 # But need more investigation on reducing memory usage
-# Assume it has no positive effect and use a large "max_batch_size" to skip splitting
+# Assume it has no possitive effect and use a large "max_batch_size" to skip splitting
 def split_groups(attention_mask, max_batch_size, ref_view=[]):
 	group_sets = []
 	group = set()
@@ -148,9 +161,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 			feature_extractor, requires_safety_checker
 		)
 
-		# CIT - Changed to DDIM to correspond with CIA
-		self.scheduler = DDIMScheduler.from_config("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
-		self.scheduler.prediction_type = "sample"
+		self.scheduler = DDPMScheduler.from_config(self.scheduler.config)
 		self.model_cpu_offload_seq = "vae->text_encoder->unet->vae"
 		self.enable_model_cpu_offload()
 		self.enable_vae_slicing()
@@ -162,10 +173,6 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 			mesh_path=None,
 			mesh_transform=None,
 			mesh_autouv=None,
-			mesh_path_app=None,
-			mesh_transform_app=None,
-			mesh_autouv_app=None,
-			tex_app_path=None,
 			camera_azims=None,
 			camera_centers=None,
 			top_cameras=True,
@@ -174,7 +181,6 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 			render_rgb_size=None,
 			texture_size=None,
 			texture_rgb_size=None,
-			texture_rgb_size_app=None,
 
 			max_batch_size=24,
 			logging_config=None,
@@ -191,17 +197,55 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				os.mkdir(dir_)
 
 
-		# 1. Initialize camera positions
 		# Define the cameras for rendering
+		self.camera_poses = []
+		self.attention_mask=[]
 		self.centers = camera_centers
-		self.camera_poses, self.attention_mask = default_cameras()
-  
 
-		# 2. Set up the UV mappings
+		cam_count = len(camera_azims)
+		front_view_diff = 360
+		back_view_diff = 360
+		front_view_idx = 0
+		back_view_idx = 0
+		for i, azim in enumerate(camera_azims):
+			if azim < 0:
+				azim += 360
+			self.camera_poses.append((0, azim))
+			self.attention_mask.append([(cam_count+i-1)%cam_count, i, (i+1)%cam_count])
+			if abs(azim) < front_view_diff:
+				front_view_idx = i
+				front_view_diff = abs(azim)
+			if abs(azim - 180) < back_view_diff:
+				back_view_idx = i
+				back_view_diff = abs(azim - 180)
+
+		# Add two additional cameras for painting the top surfaces
+		if top_cameras:
+			self.camera_poses.append((30, 0))
+			self.camera_poses.append((30, 180))
+
+			self.attention_mask.append([front_view_idx, cam_count])
+			self.attention_mask.append([back_view_idx, cam_count+1])
+
+		# Reference view for attention (all views attend the the views in this list)
+		# A forward view will be used if not specified
+		if len(ref_views) == 0:
+			ref_views = [front_view_idx]
+
+		# Calculate in-group attention mask
+		self.group_metas = split_groups(self.attention_mask, max_batch_size, ref_views)
+
+
 		# Set up pytorch3D for projection between screen space and UV space
 		# uvp is for latent and uvp_rgb for rgb color
-		self.uvp = build_uvp(mesh_path, texture_size=texture_size, render_size=latent_size, sampling_mode="nearest", channels=4, device=self._execution_device)
-
+		self.uvp = UVP(texture_size=texture_size, render_size=latent_size, sampling_mode="nearest", channels=4, device=self._execution_device)
+		if mesh_path.lower().endswith(".obj"):
+			self.uvp.load_mesh(mesh_path, scale_factor=mesh_transform["scale"] or 1, autouv=mesh_autouv)
+		elif mesh_path.lower().endswith(".glb"):
+			self.uvp.load_glb_mesh(mesh_path, scale_factor=mesh_transform["scale"] or 1, autouv=mesh_autouv)
+		else:
+			assert False, "The mesh file format is not supported. Use .obj or .glb."
+		self.uvp.set_cameras_and_render_settings(self.camera_poses, centers=camera_centers, camera_distance=4.0)
 
 
 		self.uvp_rgb = UVP(texture_size=texture_rgb_size, render_size=render_rgb_size, sampling_mode="nearest", channels=3, device=self._execution_device)
@@ -210,11 +254,11 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 		_,_,_,cos_maps,_, _ = self.uvp_rgb.render_geometry()
 		self.uvp_rgb.calculate_cos_angle_weights(cos_maps, fill=False)
 
+		# Save some VRAM
+		del _, cos_maps
 		self.uvp.to("cpu")
 		self.uvp_rgb.to("cpu")
 
-		# Save some VRAM
-		del _, cos_maps
 
 		color_images = torch.FloatTensor([color_constants[name] for name in color_names]).reshape(-1,3,1,1).to(dtype=self.text_encoder.dtype, device=self._execution_device)
 		color_images = torch.ones(
@@ -262,27 +306,16 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 		control_guidance_start: Union[float, List[float]] = 0.0,
 		control_guidance_end: Union[float, List[float]] = 0.99,
 		guidance_rescale: float = 0.0,
-		perform_swap: bool = False,
 
 		mesh_path: str = None,
 		mesh_transform: dict = None,
 		mesh_autouv = False,
-
-		mesh_path_app: str = None,
-		mesh_transform_app: dict = None,
-		mesh_autouv_app = False,
-		tex_app_path=None,
-
-		latents_save_path: str = None,
-		cond_app_path: str=None,
-
 		camera_azims=None,
 		camera_centers=None,
 		top_cameras=True,
 		texture_size = 1536,
 		render_rgb_size=1024,
 		texture_rgb_size = 1024,
-		texture_rgb_size_app = 1024,
 		multiview_diffusion_end=0.8,
 		exp_start=0.0,
 		exp_end=6.0,
@@ -294,12 +327,8 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 		ref_attention_end=0.2,
 
 		logging_config=None,
-		cond_type="depth"
+		cond_type="depth",
 	):
-		if (not os.path.isfile(latents_save_path)) or (not os.path.isfile(cond_app_path)):  
-			print(f"{latents_save_path = }")
-			print(f"{cond_app_path = }")
-			raise FileNotFoundError("Latents save path or cond app path not found")
 		
 
 		# Setup pipeline settings
@@ -307,10 +336,6 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				mesh_path=mesh_path,
 				mesh_transform=mesh_transform,
 				mesh_autouv=mesh_autouv,
-				mesh_path_app=mesh_path_app,
-				mesh_transform_app=mesh_transform_app,
-				mesh_autouv_app=mesh_autouv_app,
-				tex_app_path=tex_app_path,
 				camera_azims=camera_azims,
 				camera_centers=camera_centers,
 				top_cameras=top_cameras,
@@ -319,20 +344,13 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				render_rgb_size=render_rgb_size,
 				texture_size=texture_size,
 				texture_rgb_size=texture_rgb_size,
-				texture_rgb_size_app=texture_rgb_size_app,
 
 				max_batch_size=max_batch_size,
 
 				logging_config=logging_config
 			)
 
-		# CIT - add kwarg
-		if cross_attention_kwargs is None:
-			cross_attention_kwargs = {'perform_swap': perform_swap} 
-		elif type(cross_attention_kwargs) == dict:
-			cross_attention_kwargs['perform_swap'] = perform_swap
-		else:
-			raise(TypeError())
+
 		
 		num_timesteps = self.scheduler.config.num_train_timesteps
 		initial_controlnet_conditioning_scale = controlnet_conditioning_scale
@@ -424,13 +442,8 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 		conditioning_images, masks = get_conditioning_images(self.uvp, height, cond_type=cond_type)
 		conditioning_images = conditioning_images.type(prompt_embeds.dtype)
 		cond = (conditioning_images/2+0.5).permute(0,2,3,1).cpu().numpy()
-		numpy_to_pil(cond[0])[0].save(f"{self.intermediate_dir}/first_cond.jpg")
 		cond = np.concatenate([img for img in cond], axis=1)
 		numpy_to_pil(cond)[0].save(f"{self.intermediate_dir}/cond.jpg")
-
-		
-		print(f"Loading conditioning images from {cond_app_path}")
-		conditioning_images_app = torch.load(cond_app_path).to(torch.float16)
 
 		# 5. Prepare timesteps
 		self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -438,7 +451,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 		# 6. Prepare latent variables
 		num_channels_latents = self.unet.config.in_channels
-		latents = self.prepare_latents( # [10,4,96,96]
+		latents = self.prepare_latents(
 			batch_size,
 			num_channels_latents,
 			height,
@@ -450,21 +463,14 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 		)
 
 		latent_tex = self.uvp.set_noise_texture()
-		noise_views = self.uvp.render_textured_views() # list of 10 tensors, each got 5 channels, the last one is the mask (aka transparency aka alpha), and the other 4 are latent channels
-		foregrounds = [view[:-1] for view in noise_views] # here are the latent channels
-		masks = [view[-1:] for view in noise_views] # here is the 5th channel, the mask
+		noise_views = self.uvp.render_textured_views()
+		foregrounds = [view[:-1] for view in noise_views]
+		masks = [view[-1:] for view in noise_views]
 		composited_tensor = composite_rendered_view(self.scheduler, latents, foregrounds, masks, timesteps[0]+1)
 		latents = composited_tensor.type(latents.dtype)
 		self.uvp.to("cpu")
 
-		# CIT
-		latents_app = torch.load(latents_save_path).to(torch.float16)
-   
-		########################################################################################
-		### Right now, latents_app is the noisiest latent: the shape is [10, 4, 64, 64] ########
-		### The following change is that latents_app is all the latents [10, 100, 4, 64, 64] ###
-		########################################################################################
-   
+
 		# 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
 		extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -481,15 +487,12 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 		# 8. Denoising loop
 		num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 		intermediate_results = []
-		intermediate_results_app = []
 		background_colors = [random.choice(list(color_constants.keys())) for i in range(len(self.camera_poses))]
 		dbres_sizes_list = []
 		mbres_size_list = []
-		# with torch.autocast(device_type=self._execution_device, dtype=torch.float16):
 		with self.progress_bar(total=num_inference_steps) as progress_bar:
 			for i, t in enumerate(timesteps):
-				print(f"{datetime.now()}: iteration {i}, timestep {t}")
-				print(f"Memory Usage: {(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)):.2f} MB")
+
 				# mix prompt embeds according to azim angle
 				positive_prompt_embeds = [azim_prompt(prompt_embed_dict, pose) for pose in self.camera_poses]
 				positive_prompt_embeds = torch.stack(positive_prompt_embeds, axis=0)
@@ -499,8 +502,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 
 				# expand the latents if we are doing classifier free guidance
-				latent_model_input = self.scheduler.scale_model_input(latents, t).to(torch.float16).to(self._execution_device)
-				latent_model_input_app = self.scheduler.scale_model_input(latents_app[i], t).to(torch.float16).to(self._execution_device)
+				latent_model_input = self.scheduler.scale_model_input(latents, t)
 
 				'''
 					Use groups to manage prompt and results
@@ -508,19 +510,15 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				'''
 				prompt_embeds_groups = {"positive": positive_prompt_embeds}
 				result_groups = {}
-				result_groups_app = {}
 				if do_classifier_free_guidance:
 					prompt_embeds_groups["negative"] = negative_prompt_embeds
 
-				for prompt_tag, prompt_embeds in prompt_embeds_groups.items(): # Lidor asks: how many times does this loop run?
+				for prompt_tag, prompt_embeds in prompt_embeds_groups.items():
 					if prompt_tag == "positive" or not guess_mode:
 						# controlnet(s) inference
-						if self._execution_device == "cpu": #TODO delete this
-							print("wtf")
-							exit(1)
-						control_model_input = latent_model_input.to(self._execution_device).to(torch.float16)
-						control_model_input_app = latent_model_input_app.to(self._execution_device).to(torch.float16)
-						controlnet_prompt_embeds = prompt_embeds.to(self._execution_device).to(torch.float16)
+						control_model_input = latent_model_input
+						controlnet_prompt_embeds = prompt_embeds
+
 
 						if isinstance(controlnet_keep[i], list):
 							cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
@@ -535,13 +533,9 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 						down_block_res_samples_list = []
 						mid_block_res_sample_list = []
 
-						# CIT - modify batches
-						model_input_batches = [torch.stack((control_model_input[i].to(torch.float16).to(self._execution_device), control_model_input[i].to(torch.float16).to(self._execution_device), control_model_input_app[i].to(torch.float16).to(self._execution_device))).to(torch.float16).to(self._execution_device) for i in range(latents.shape[0])]
-						prompt_embeds_batches = [torch.stack((embed, embed, embed)).to(torch.float16).to(self._execution_device) for embed in controlnet_prompt_embeds]
-
-						to_cuda = lambda x: x.to(torch.float16).to(self._execution_device)
-						# conditioning_images_batches = [torch.stack((conditioning_images[i].to(torch.float16).to(self._execution_device), conditioning_images[i].to(torch.float16).to(self._execution_device), conditioning_images_app[i].to(torch.float16).to(self._execution_device))) for i in range(conditioning_images.shape[0])]
-						conditioning_images_batches = [torch.stack((to_cuda(conditioning_images[i]), to_cuda(conditioning_images[i]), to_cuda(conditioning_images_app[i]))) for i in range(conditioning_images.shape[0])]
+						model_input_batches = [torch.index_select(control_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+						prompt_embeds_batches = [torch.index_select(controlnet_prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+						conditioning_images_batches = [torch.index_select(conditioning_images, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
 
 						for model_input_batch ,prompt_embeds_batch, conditioning_images_batch \
 							in zip (model_input_batches, prompt_embeds_batches, conditioning_images_batches):
@@ -586,19 +580,23 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 
 					'''
+					
 						predict the noise residual, split into mini-batches
 						Downblock res samples has n samples, we split each sample into m batches
 						and re group them into m lists of n mini batch samples.
 					
 					'''
 					noise_pred_list = []
-					noise_pred_app_list = []
-					# CIT - need to modify the batches so that they contain appearance latents
-					model_input_batches = [torch.stack((latent_model_input[i], latent_model_input[i], latent_model_input_app[i])).to(torch.float16) for i in range(latents.shape[0])]
-					prompt_embeds_batches = [torch.stack((embed, embed, embed)) for embed in prompt_embeds]
+					model_input_batches = [torch.index_select(latent_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					prompt_embeds_batches = [torch.index_select(prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
 
-					for model_input_batch, prompt_embeds_batch, down_block_res_samples_batch, mid_block_res_sample_batch \
-						in zip(model_input_batches, prompt_embeds_batches, down_block_res_samples_list, mid_block_res_sample_list):
+					for model_input_batch, prompt_embeds_batch, down_block_res_samples_batch, mid_block_res_sample_batch, meta \
+						in zip(model_input_batches, prompt_embeds_batches, down_block_res_samples_list, mid_block_res_sample_list, self.group_metas):
+						if t > num_timesteps * (1- ref_attention_end):
+							replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=1)
+						else:
+							replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=0)
+
 						noise_pred = self.unet(
 							model_input_batch,
 							t,
@@ -608,74 +606,49 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 							mid_block_additional_residual=mid_block_res_sample_batch,
 							return_dict=False,
 						)[0]
-						noise_pred_list.append(noise_pred[0])
-						noise_pred_app_list.append(noise_pred[2])
+						noise_pred_list.append(noise_pred)
 
-					# TODO: Make sure that the noise gets to the right place.
-
-					noise_pred = torch.stack(noise_pred_list).to(torch.float16)
-					noise_pred_app = torch.stack(noise_pred_app_list).to(torch.float16)
+					noise_pred_list = [torch.index_select(noise_pred, dim=0, index=torch.tensor(meta[1], device=self._execution_device)) for noise_pred, meta in zip(noise_pred_list, self.group_metas)]
+					noise_pred = torch.cat(noise_pred_list, dim=0)
 					down_block_res_samples_list = None
 					mid_block_res_sample_list = None
 					noise_pred_list = None
 					model_input_batches = prompt_embeds_batches = down_block_res_samples_batches = mid_block_res_sample_batches = None
 
 					result_groups[prompt_tag] = noise_pred
-					result_groups_app[prompt_tag] = noise_pred_app
 
 				positive_noise_pred = result_groups["positive"]
-				positive_noise_pred_app = result_groups_app["positive"]
 
 				# perform guidance
 				if do_classifier_free_guidance:
 					noise_pred = result_groups["negative"] + guidance_scale * (positive_noise_pred - result_groups["negative"])
-					noise_pred_app = result_groups_app["negative"] + guidance_scale * (positive_noise_pred_app - result_groups_app["negative"])
 
-				# CIT - This seems unreachable and references things that do not exist, so I comment it here
-				# if do_classifier_free_guidance and guidance_rescale > 0.0:
+
+				if do_classifier_free_guidance and guidance_rescale > 0.0:
 					# Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-					# noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+					noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
-				self.uvp.to(self._execution_device) #TODO wtf is going here? maybe: self.uvp = self.uvp.to(self._execution_device) ?
+				self.uvp.to(self._execution_device)
 				# compute the previous noisy sample x_t -> x_t-1
 				# Multi-View step or individual step
 				current_exp = ((exp_end-exp_start) * i / num_inference_steps) + exp_start
 				if t > (1-multiview_diffusion_end)*num_timesteps:
-					prev_t = (t + (t - timesteps[i + 1])) if i == 0 else timesteps[i - 1]
-					scheduler_copy = copy.deepcopy(self.scheduler)
 					step_results = step_tex(
 						scheduler=self.scheduler, 
 						uvp=self.uvp, 
 						model_output=noise_pred, 
-						timestep=t,
-						prev_t=prev_t,
-						sample=latents.to(self._execution_device), 
-						texture=latent_tex.to(self._execution_device),
+						timestep=t, 
+						sample=latents, 
+						texture=latent_tex,
 						return_dict=True, 
 						main_views=[], 
-						exp=current_exp,
-						**extra_step_kwargs
-					)
-					step_results_app = step_tex(
-						scheduler=scheduler_copy, 
-						uvp=None, 
-						model_output=noise_pred_app, 
-						timestep=t,
-						prev_t=prev_t,
-						sample=latents_app[i].to(self._execution_device), 
-						texture=latent_tex.to(self._execution_device),
-						return_dict=True, 
-						main_views=[], 
-						exp=current_exp,
-						is_app=True,
+						exp= current_exp,
 						**extra_step_kwargs
 					)
 
 					pred_original_sample = step_results["pred_original_sample"]
 					latents = step_results["prev_sample"]
 					latent_tex = step_results["prev_tex"]
-					pred_original_sample_app = step_results_app["pred_original_sample"]
-					# latents_app = step_results_app["prev_sample"] # CIT - This is not used since the latents are supplied for all timesteps.
 
 					# Composit latent foreground with random color background
 					background_latents = [self.color_latents[color] for color in background_colors]
@@ -683,26 +656,21 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					latents = composited_tensor.type(latents.dtype)
 
 					intermediate_results.append((latents.to("cpu"), pred_original_sample.to("cpu")))
-					intermediate_results_app.append((latents_app[i].to("cpu"), pred_original_sample_app.to("cpu")))
 				else:
-					step_results = self.scheduler.step(noise_pred.to(self._execution_device), t, latents.to(self._execution_device), **extra_step_kwargs, return_dict=True)
-					step_results_app = self.scheduler.step(noise_pred_app.to(self._execution_device), t, latents_app[i].to(self._execution_device), **extra_step_kwargs, return_dict=True)
+					step_results = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=True)
 
 					pred_original_sample = step_results["pred_original_sample"]
 					latents = step_results["prev_sample"]
 					latent_tex = None
-					pred_original_sample_app = step_results_app["pred_original_sample"]
-					# latents_app = step_results_app["prev_sample"] # CIT - This is not used since the latents are supplied for all timesteps.
 
 					intermediate_results.append((latents.to("cpu"), pred_original_sample.to("cpu")))
-					intermediate_results_app.append((latents_app[i].to("cpu"), pred_original_sample_app.to("cpu")))
 
-				del noise_pred, noise_pred_app, result_groups, result_groups_app
+				del noise_pred, result_groups
 					
 
 
-				# 9. Update pipeline settings after one step:
-				# 9.1. Annealing ControlNet scale
+				# Update pipeline settings after one step:
+				# 1. Annealing ControlNet scale
 				if (1-t/num_timesteps) < control_guidance_start[0]:
 					controlnet_conditioning_scale = initial_controlnet_conditioning_scale
 				elif (1-t/num_timesteps) > control_guidance_end[0]:
@@ -711,7 +679,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					alpha = ((1-t/num_timesteps) - control_guidance_start[0]) / (control_guidance_end[0] - control_guidance_start[0])
 					controlnet_conditioning_scale = alpha * initial_controlnet_conditioning_scale + (1-alpha) * controlnet_conditioning_end_scale
 
-				# 9.2. Shuffle background colors; only black and white used after certain timestep
+				# 2. Shuffle background colors; only black and white used after certain timestep
 				if (1-t/num_timesteps) < shuffle_background_change:
 					background_colors = [random.choice(list(color_constants.keys())) for i in range(len(self.camera_poses))]
 				elif (1-t/num_timesteps) < shuffle_background_end:
@@ -721,12 +689,12 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 
 
-				# 10. Logging at "log_interval" intervals and last step
+				# Logging at "log_interval" intervals and last step
 				# Choose to uses color approximation or vae decoding
 				if i % log_interval == log_interval-1 or t == 1:
 					if view_fast_preview:
 						decoded_results = []
-						for latent_images in intermediate_results[-1]: # TODO why does it runs twice? tell lidor, he is curious
+						for latent_images in intermediate_results[-1]:
 							images = latent_preview(latent_images.to(self._execution_device))
 							images = np.concatenate([img for img in images], axis=1)
 							decoded_results.append(images)
@@ -736,7 +704,9 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 						decoded_results = []
 						for latent_images in intermediate_results[-1]:
 							images = decode_latents(self.vae, latent_images.to(self._execution_device))
+
 							images = np.concatenate([img for img in images], axis=1)
+
 							decoded_results.append(images)
 						result_image = np.concatenate(decoded_results, axis=0)
 						numpy_to_pil(result_image)[0].save(f"{self.intermediate_dir}/step_{i:02d}.jpg")
