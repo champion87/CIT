@@ -199,7 +199,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 		# Define the cameras for rendering
 		self.camera_poses = []
-		self.attention_mask=[]
+		# self.attention_mask=[]
 		self.centers = camera_centers
 
 		cam_count = len(camera_azims)
@@ -211,7 +211,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 			if azim < 0:
 				azim += 360
 			self.camera_poses.append((0, azim))
-			self.attention_mask.append([(cam_count+i-1)%cam_count, i, (i+1)%cam_count])
+			# self.attention_mask.append([(cam_count+i-1)%cam_count, i, (i+1)%cam_count])
 			if abs(azim) < front_view_diff:
 				front_view_idx = i
 				front_view_diff = abs(azim)
@@ -224,16 +224,16 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 			self.camera_poses.append((30, 0))
 			self.camera_poses.append((30, 180))
 
-			self.attention_mask.append([front_view_idx, cam_count])
-			self.attention_mask.append([back_view_idx, cam_count+1])
+			# self.attention_mask.append([front_view_idx, cam_count])
+			# self.attention_mask.append([back_view_idx, cam_count+1])
 
 		# Reference view for attention (all views attend the the views in this list)
 		# A forward view will be used if not specified
-		if len(ref_views) == 0:
-			ref_views = [front_view_idx]
+		# if len(ref_views) == 0:
+		# 	ref_views = [front_view_idx]
 
 		# Calculate in-group attention mask
-		self.group_metas = split_groups(self.attention_mask, max_batch_size, ref_views)
+		# self.group_metas = split_groups(self.attention_mask, max_batch_size, ref_views)
 
 
 		# Set up pytorch3D for projection between screen space and UV space
@@ -518,8 +518,8 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				' Here we perform controlnet inference and unet prediction twice: once for positive and once for negative prompt for cfg '
 				for prompt_tag, prompt_embeds in prompt_embeds_groups.items():
 					# controlnet(s) inference
-					control_model_input = latent_model_input
-					controlnet_prompt_embeds = prompt_embeds
+					# control_model_input = latent_model_input
+					# controlnet_prompt_embeds = prompt_embeds
 
 
 					if isinstance(controlnet_keep[i], list):
@@ -532,32 +532,26 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 					# Split into micro-batches according to group meta info
 					# Ignore this feature for now
-					down_block_res_samples_list = []
-					mid_block_res_sample_list = []
 
-					model_input_batches = [torch.index_select(control_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-					prompt_embeds_batches = [torch.index_select(controlnet_prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-					conditioning_images_batches = [torch.index_select(conditioning_images, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					# model_input_batches = [torch.index_select(control_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					# prompt_embeds_batches = [torch.index_select(controlnet_prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					# conditioning_images_batches = [torch.index_select(conditioning_images, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
 
-					''' Here we perform controlnet inference. Once for each mini-batch. '''
-					# TODO This runs only once. Why.?
-					for model_input_batch ,prompt_embeds_batch, conditioning_images_batch \
-						in zip (model_input_batches, prompt_embeds_batches, conditioning_images_batches):
-						down_block_res_samples, mid_block_res_sample = self.controlnet(
-							model_input_batch,
-							t,
-							encoder_hidden_states=prompt_embeds_batch,
-							controlnet_cond=conditioning_images_batch,
-							conditioning_scale=cond_scale,
-							guess_mode=guess_mode,
-							return_dict=False,
-						)
-						down_block_res_samples_list.append(down_block_res_samples)
-						mid_block_res_sample_list.append(mid_block_res_sample)
+					''' Here we perform controlnet inference. '''
+					# for model_input_batch ,prompt_embeds_batch, conditioning_images_batch \
+					# 	in zip (model_input_batches, prompt_embeds_batches, conditioning_images_batches):
+					down_block_res_samples, mid_block_res_sample = self.controlnet(
+						latent_model_input,
+						t,
+						encoder_hidden_states=prompt_embeds,
+						controlnet_cond=conditioning_images,
+						conditioning_scale=cond_scale,
+						guess_mode=guess_mode,
+						return_dict=False,
+					)
+					# down_block_res_samples_list.append(down_block_res_samples)
+					# mid_block_res_sample_list.append(mid_block_res_sample)
 
-					''' For the ith element of down_block_res_samples, concat the ith element of all mini-batch result '''
-					model_input_batches = prompt_embeds_batches = conditioning_images_batches = None
-			
 					'''
 
 						predict the noise residual, split into mini-batches
@@ -566,35 +560,34 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					
 					'''
 					noise_pred_list = []
-					model_input_batches = [torch.index_select(latent_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-					prompt_embeds_batches = [torch.index_select(prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					# model_input_batches = [torch.index_select(latent_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					# prompt_embeds_batches = [torch.index_select(prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
 
 					''' Here we perform unet prediction. Once for each mini-batch. '''
 					# TODO again, this runs only once.
-					for model_input_batch, prompt_embeds_batch, down_block_res_samples_batch, mid_block_res_sample_batch, meta \
-						in zip(model_input_batches, prompt_embeds_batches, down_block_res_samples_list, mid_block_res_sample_list, self.group_metas):
-						if t > num_timesteps * (1- ref_attention_end): # TODO why are they replacing attention proccessors here? check it out
-							replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=1)
-						else:
-							replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=0)
+					# for model_input_batch, prompt_embeds_batch, down_block_res_samples_batch, mid_block_res_sample_batch, meta \
+					# 	in zip(model_input_batches, prompt_embeds_batches, down_block_res_samples_list, mid_block_res_sample_list, self.group_metas):
+     
+					# TODO replace attention processors with cit proccessors
+					# if t > num_timesteps * (1- ref_attention_end): # TODO why are they replacing attention proccessors here? check it out
+					# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=1)
+					# else:
+					# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=0)
 
-						noise_pred = self.unet(
-							model_input_batch, # [10, 4, 96, 96]
-							t,
-							encoder_hidden_states=prompt_embeds_batch,
-							cross_attention_kwargs=cross_attention_kwargs,
-							down_block_additional_residuals=down_block_res_samples_batch,
-							mid_block_additional_residual=mid_block_res_sample_batch,
-							return_dict=False,
-						)[0]
-						noise_pred_list.append(noise_pred)
+					noise_pred = self.unet(
+						latent_model_input, # [10, 4, 96, 96]
+						t,
+						encoder_hidden_states=prompt_embeds,
+						cross_attention_kwargs=cross_attention_kwargs,
+						down_block_additional_residuals=down_block_res_samples,
+						mid_block_additional_residual=mid_block_res_sample,
+						return_dict=False,
+					)[0]
+					# noise_pred_list.append(noise_pred)
 
-					noise_pred_list = [torch.index_select(noise_pred, dim=0, index=torch.tensor(meta[1], device=self._execution_device)) for noise_pred, meta in zip(noise_pred_list, self.group_metas)]
-					noise_pred = torch.cat(noise_pred_list, dim=0)
-					down_block_res_samples_list = None
-					mid_block_res_sample_list = None
-					noise_pred_list = None
-					model_input_batches = prompt_embeds_batches = down_block_res_samples_batches = mid_block_res_sample_batches = None
+					# noise_pred_list = [torch.index_select(noise_pred, dim=0, index=torch.tensor(meta[1], device=self._execution_device)) for noise_pred, meta in zip(noise_pred_list, self.group_metas)]
+					# noise_pred = torch.cat(noise_pred_list, dim=0)
+					# noise_pred_list = None
 
 					result_groups[prompt_tag] = noise_pred
 

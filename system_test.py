@@ -8,9 +8,10 @@ from PIL import Image
 import glob
 
 test_experiments = ["bed", "face", "cactus", "dog", "tiger"]
+more_experiments = ["fish1", "fish2", "guitar", "dragon"]
 
-def run_all_experiments():
-	for name in test_experiments:
+def run_all_experiments(experiments):
+	for name in experiments:
 		run_experiment(name)
     
 def wait_for_jobs():
@@ -50,7 +51,8 @@ def get_results_from_tmp():
 		os.remove(img_path)
 	
 if __name__ == "__main__":
-	run_all_experiments()
+	# run_all_experiments(test_experiments)
+	run_all_experiments(more_experiments)
 	print("\n\nAll jobs have been submitted. Waiting for all jobs to finish...\n")
 	wait_for_jobs()
 	get_results_from_tmp()
