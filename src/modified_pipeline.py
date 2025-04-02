@@ -38,9 +38,9 @@ from .renderer.project import UVProjection as UVP
 
 
 from .syncmvd.attention import SamplewiseAttnProcessor2_0, replace_attention_processors
-from .syncmvd.prompt import *
+from .syncmvd.prompt import prepare_prompt, prepare_negative_prompt, direction_names
 from .syncmvd.step import step_tex
-from .utils import *
+from .utils import encode_latents, prepare_directional_prompt, azim_prompt, azim_neg_prompt, smvd_log, get_rgb_texture, rescale_noise_cfg
 
 
 
@@ -490,6 +490,8 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 		background_colors = [random.choice(list(color_constants.keys())) for i in range(len(self.camera_poses))]
 		dbres_sizes_list = []
 		mbres_size_list = []
+  
+		' This is the denoising loop '
 		with self.progress_bar(total=num_inference_steps) as progress_bar:
 			for i, t in enumerate(timesteps):
 
@@ -513,74 +515,51 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				if do_classifier_free_guidance:
 					prompt_embeds_groups["negative"] = negative_prompt_embeds
 
+				' Here we perform controlnet inference and unet prediction twice: once for positive and once for negative prompt for cfg '
 				for prompt_tag, prompt_embeds in prompt_embeds_groups.items():
-					if prompt_tag == "positive" or not guess_mode:
-						# controlnet(s) inference
-						control_model_input = latent_model_input
-						controlnet_prompt_embeds = prompt_embeds
+					# controlnet(s) inference
+					control_model_input = latent_model_input
+					controlnet_prompt_embeds = prompt_embeds
 
 
-						if isinstance(controlnet_keep[i], list):
-							cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
-						else:
-							controlnet_cond_scale = controlnet_conditioning_scale
-							if isinstance(controlnet_cond_scale, list):
-								controlnet_cond_scale = controlnet_cond_scale[0]
-							cond_scale = controlnet_cond_scale * controlnet_keep[i]
-
-						# Split into micro-batches according to group meta info
-						# Ignore this feature for now
-						down_block_res_samples_list = []
-						mid_block_res_sample_list = []
-
-						model_input_batches = [torch.index_select(control_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-						prompt_embeds_batches = [torch.index_select(controlnet_prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-						conditioning_images_batches = [torch.index_select(conditioning_images, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-
-						for model_input_batch ,prompt_embeds_batch, conditioning_images_batch \
-							in zip (model_input_batches, prompt_embeds_batches, conditioning_images_batches):
-							down_block_res_samples, mid_block_res_sample = self.controlnet(
-								model_input_batch,
-								t,
-								encoder_hidden_states=prompt_embeds_batch,
-								controlnet_cond=conditioning_images_batch,
-								conditioning_scale=cond_scale,
-								guess_mode=guess_mode,
-								return_dict=False,
-							)
-							down_block_res_samples_list.append(down_block_res_samples)
-							mid_block_res_sample_list.append(mid_block_res_sample)
-
-						''' For the ith element of down_block_res_samples, concat the ith element of all mini-batch result '''
-						model_input_batches = prompt_embeds_batches = conditioning_images_batches = None
-
-						if guess_mode:
-							for dbres in down_block_res_samples_list:
-								dbres_sizes = []
-								for res in dbres:
-									dbres_sizes.append(res.shape)
-								dbres_sizes_list.append(dbres_sizes)
-
-							for mbres in mid_block_res_sample_list:
-								mbres_size_list.append(mbres.shape)
-
+					if isinstance(controlnet_keep[i], list):
+						cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
 					else:
-						# Infered ControlNet only for the conditional batch.
-						# To apply the output of ControlNet to both the unconditional and conditional batches,
-						# add 0 to the unconditional batch to keep it unchanged.
-						# We copy the tensor shapes from a conditional batch
-						down_block_res_samples_list = []
-						mid_block_res_sample_list = []
-						for dbres_sizes in dbres_sizes_list:
-							down_block_res_samples_list.append([torch.zeros(shape, device=self._execution_device, dtype=latents.dtype) for shape in dbres_sizes])
-						for mbres in mbres_size_list:
-							mid_block_res_sample_list.append(torch.zeros(mbres, device=self._execution_device, dtype=latents.dtype))
-						dbres_sizes_list = []
-						mbres_size_list = []
+						controlnet_cond_scale = controlnet_conditioning_scale
+						if isinstance(controlnet_cond_scale, list):
+							controlnet_cond_scale = controlnet_cond_scale[0]
+						cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
+					# Split into micro-batches according to group meta info
+					# Ignore this feature for now
+					down_block_res_samples_list = []
+					mid_block_res_sample_list = []
 
+					model_input_batches = [torch.index_select(control_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					prompt_embeds_batches = [torch.index_select(controlnet_prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+					conditioning_images_batches = [torch.index_select(conditioning_images, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
+
+					''' Here we perform controlnet inference. Once for each mini-batch. '''
+					# TODO This runs only once. Why.?
+					for model_input_batch ,prompt_embeds_batch, conditioning_images_batch \
+						in zip (model_input_batches, prompt_embeds_batches, conditioning_images_batches):
+						down_block_res_samples, mid_block_res_sample = self.controlnet(
+							model_input_batch,
+							t,
+							encoder_hidden_states=prompt_embeds_batch,
+							controlnet_cond=conditioning_images_batch,
+							conditioning_scale=cond_scale,
+							guess_mode=guess_mode,
+							return_dict=False,
+						)
+						down_block_res_samples_list.append(down_block_res_samples)
+						mid_block_res_sample_list.append(mid_block_res_sample)
+
+					''' For the ith element of down_block_res_samples, concat the ith element of all mini-batch result '''
+					model_input_batches = prompt_embeds_batches = conditioning_images_batches = None
+			
 					'''
-					
+
 						predict the noise residual, split into mini-batches
 						Downblock res samples has n samples, we split each sample into m batches
 						and re group them into m lists of n mini batch samples.
@@ -590,15 +569,17 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					model_input_batches = [torch.index_select(latent_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
 					prompt_embeds_batches = [torch.index_select(prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
 
+					''' Here we perform unet prediction. Once for each mini-batch. '''
+					# TODO again, this runs only once.
 					for model_input_batch, prompt_embeds_batch, down_block_res_samples_batch, mid_block_res_sample_batch, meta \
 						in zip(model_input_batches, prompt_embeds_batches, down_block_res_samples_list, mid_block_res_sample_list, self.group_metas):
-						if t > num_timesteps * (1- ref_attention_end):
+						if t > num_timesteps * (1- ref_attention_end): # TODO why are they replacing attention proccessors here? check it out
 							replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=1)
 						else:
 							replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=0)
 
 						noise_pred = self.unet(
-							model_input_batch,
+							model_input_batch, # [10, 4, 96, 96]
 							t,
 							encoder_hidden_states=prompt_embeds_batch,
 							cross_attention_kwargs=cross_attention_kwargs,
@@ -632,7 +613,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				# compute the previous noisy sample x_t -> x_t-1
 				# Multi-View step or individual step
 				current_exp = ((exp_end-exp_start) * i / num_inference_steps) + exp_start
-				if t > (1-multiview_diffusion_end)*num_timesteps:
+				if t > (1-multiview_diffusion_end)*num_timesteps: # TODO This is where they cut off the multi-view diffusion. Do we keep that?
 					step_results = step_tex(
 						scheduler=self.scheduler, 
 						uvp=self.uvp, 
@@ -691,36 +672,9 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 				# Logging at "log_interval" intervals and last step
 				# Choose to uses color approximation or vae decoding
-				if i % log_interval == log_interval-1 or t == 1:
-					if view_fast_preview:
-						decoded_results = []
-						for latent_images in intermediate_results[-1]:
-							images = latent_preview(latent_images.to(self._execution_device))
-							images = np.concatenate([img for img in images], axis=1)
-							decoded_results.append(images)
-						result_image = np.concatenate(decoded_results, axis=0)
-						numpy_to_pil(result_image)[0].save(f"{self.intermediate_dir}/step_{i:02d}.jpg")
-					else:
-						decoded_results = []
-						for latent_images in intermediate_results[-1]:
-							images = decode_latents(self.vae, latent_images.to(self._execution_device))
-
-							images = np.concatenate([img for img in images], axis=1)
-
-							decoded_results.append(images)
-						result_image = np.concatenate(decoded_results, axis=0)
-						numpy_to_pil(result_image)[0].save(f"{self.intermediate_dir}/step_{i:02d}.jpg")
-
-					if not t < (1-multiview_diffusion_end)*num_timesteps:
-						if tex_fast_preview:
-							tex = latent_tex.clone()
-							texture_color = latent_preview(tex[None, ...])
-							numpy_to_pil(texture_color)[0].save(f"{self.intermediate_dir}/texture_{i:02d}.jpg")
-						else:
-							self.uvp_rgb.to(self._execution_device)
-							result_tex_rgb, result_tex_rgb_output = get_rgb_texture(self.vae, self.uvp_rgb, pred_original_sample)
-							numpy_to_pil(result_tex_rgb_output)[0].save(f"{self.intermediate_dir}/texture_{i:02d}.png")
-							self.uvp_rgb.to("cpu")
+				if i % log_interval == log_interval-1 or t == 1: #TODO check if it works now that it is a single function
+					smvd_log(self, intermediate_results, i, t, num_timesteps, multiview_diffusion_end, 
+						view_fast_preview, tex_fast_preview, latent_tex, pred_original_sample)
 
 				self.uvp.to("cpu")
 

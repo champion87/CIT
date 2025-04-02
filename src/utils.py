@@ -64,3 +64,147 @@ def get_rgb_texture(vae, uvp_rgb, latents):
 	return result_tex_rgb, result_tex_rgb_output
 
 
+from datetime import datetime
+import numpy as np
+from diffusers.utils import numpy_to_pil
+import torch
+from PIL import Image
+
+lidor_dir = "/home/ML_courses/03683533_2024/lidor_yael_snir/new_semester/cross-image-texturing/results/lidor"
+
+def get_gpu_copy(tensor):
+	"""Returns a copy of the tensor on the GPU.
+	unused now, but might use it later."""
+	return tensor.to("cuda:0", dtype=torch.float16)
+
+def concat_images_vertically(images):
+    # Get total height and maximum width
+	total_height = sum(img.height for img in images)
+	max_width = max(img.width for img in images)
+
+	# Create a new blank image with the right size
+	concatenated_img = Image.new("RGB", (max_width, total_height))
+
+	# Paste images on top of each other
+	y_offset = 0
+	for img in images:
+		concatenated_img.paste(img, (0, y_offset))
+		y_offset += img.height
+
+	return concatenated_img
+
+def concat_images_horizontally(images):
+    if type(images) == torch.Tensor:
+        images = [tensor_to_image(img) for img in images]
+    # Get total width and maximum height
+    total_width = sum(img.width for img in images)
+    max_height = max(img.height for img in images)
+
+    # Create a new blank image with the right size
+    concatenated_img = Image.new("RGB", (total_width, max_height))
+
+    # Paste images side by side
+    x_offset = 0
+    for img in images:
+        concatenated_img.paste(img, (x_offset, 0))
+        x_offset += img.width
+
+    return concatenated_img
+
+def image_to_tensor(image):
+    return (torch.from_numpy(np.array(image)) / 255.0).permute(2, 0, 1)
+
+def tensor_to_image(tensor):
+    return Image.fromarray((tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+
+def show_views(views, dest_dir=lidor_dir, save=True): # Deprecated, can't remember what it does
+	result_images = []
+	for view in views:
+		rgb_image = view[:3].permute(1, 2, 0).cpu().numpy() # Shape: (H, W, 3)
+		result_images.append(rgb_image)
+	concatenated_image = np.concatenate(result_images, axis=1)
+	res_image = numpy_to_pil(concatenated_image)[0]
+	if save:
+		res_image.save(f"{dest_dir}/show_views_at{datetime.now().strftime('%d%b%Y-%H%M%S')}.jpg")
+	return res_image
+ 
+def save_all_views(views, dest_dir=lidor_dir):
+	for i, view in enumerate(views):
+		rgb_image = view[:3].permute(1, 2, 0).cpu().numpy() # Shape: (H, W, 3)
+		numpy_to_pil(rgb_image)[0].save(f"{dest_dir}/face_view_{i}.jpg")
+ 
+def show_mesh(uvp, dest_dir=lidor_dir, save=True, texture=None): #TODO what if the mesh is rendered in latent space?
+	"""uvp can be a path to a saved model or a UVP object."""
+
+	if type(uvp) == str:
+		from uvp_utils import build_uvp
+		# if not texture:
+		# 	texture = Image.new("RGB", (1024, 1024), "white")
+		uvp = build_uvp(uvp, texture)
+	device = uvp.device
+  
+	uvp.to("cuda:0")
+	views = uvp.render_textured_views()
+	uvp.to(device)
+
+	return show_views(views, dest_dir, save)
+ 
+def show_latents(latents, dest_dir=lidor_dir, save=True, only_last=False):
+	"""
+	Latents can be a tensor of shape (N, L) or (L,), or path.
+	"""
+	if isinstance(latents, str):
+		latents = torch.load(latents)
+ 
+	if (len(latents.shape) == 3):
+		latents = latents.unsqueeze(0)
+  
+	if only_last:
+		latents = latents[-1]
+  
+	if (len(latents.shape) == 3):
+		latents = latents.unsqueeze(0).unsqueeze(0)
+	elif (len(latents.shape) == 4):
+		latents = latents.unsqueeze(0)
+
+	views = []
+	for view in latents:
+		view = view.to(torch.float16).to("cpu")
+		decoded_latents = latent_preview(view)
+		concatenated_image = np.concatenate(decoded_latents, axis=1)
+		views.append(concatenated_image)
+	concatenated_image = np.concatenate(views, axis=0)
+	res_image = numpy_to_pil(concatenated_image)[0]
+	if save:
+		res_image.save(f"{dest_dir}/show_latent_at{datetime.now().strftime('%d%b%Y-%H%M%S')}.jpg")
+	return res_image
+
+def smvd_log(pipe, intermediate_results, i, t, num_timesteps, multiview_diffusion_end, 
+			 view_fast_preview, tex_fast_preview, latent_tex, pred_original_sample):
+	if view_fast_preview:
+		decoded_results = []
+		for latent_images in intermediate_results[-1]:
+			images = latent_preview(latent_images.to(pipe._execution_device))
+			images = np.concatenate([img for img in images], axis=1)
+			decoded_results.append(images)
+		result_image = np.concatenate(decoded_results, axis=0)
+		numpy_to_pil(result_image)[0].save(f"{pipe.intermediate_dir}/step_{i:02d}.jpg")
+	else:
+		decoded_results = []
+		for latent_images in intermediate_results[-1]:
+			images = decode_latents(pipe.vae, latent_images.to(pipe._execution_device))
+			images = np.concatenate([img for img in images], axis=1)
+			decoded_results.append(images)
+		result_image = np.concatenate(decoded_results, axis=0)
+		numpy_to_pil(result_image)[0].save(f"{pipe.intermediate_dir}/step_{i:02d}.jpg")
+
+	if not t < (1 - multiview_diffusion_end) * num_timesteps:
+		if tex_fast_preview:
+			tex = latent_tex.clone()
+			texture_color = latent_preview(tex[None, ...])
+			numpy_to_pil(texture_color)[0].save(f"{pipe.intermediate_dir}/texture_{i:02d}.jpg")
+		else:
+			pipe.uvp_rgb.to(pipe._execution_device)
+			result_tex_rgb, result_tex_rgb_output = get_rgb_texture(pipe.vae, pipe.uvp_rgb, pred_original_sample)
+			numpy_to_pil(result_tex_rgb_output)[0].save(f"{pipe.intermediate_dir}/texture_{i:02d}.png")
+			pipe.uvp_rgb.to("cpu")

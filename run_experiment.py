@@ -40,7 +40,7 @@ def run_slurm(python_line, name):
 
 def notify_empty_queue():
     is_queue_not_empty = os.system("squeue --me | grep -q killable")
-    check_loop = f"while {is_queue_not_empty}; do sleep 10; echo 'Job Still Running' done; echo 'Job finished!'"
+    check_loop = f"while {is_queue_not_empty}; do sleep 10; echo 'Job Still Running'; done; echo 'Job finished!'"
     os.system(check_loop)
 
 if __name__ == "__main__":

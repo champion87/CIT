@@ -10,4 +10,5 @@ log_interval: 1
 tex_fast_preview: True
 view_fast_preview: True
 # prefix: "OG_SMVD"
-prefix: "MY_SMVD"
+# prefix: "MY_SMVD"
+prefix: "LOG"
