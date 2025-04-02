@@ -66,6 +66,8 @@ class UVProjection():
 			mesh = io.load_mesh(f, include_textures=True, device=self.device)
 		if auto_center:
 			verts = mesh.verts_packed()
+			verts[:, 1] = -verts[:, 1]
+			verts[:, 2] = -verts[:, 2]
 			max_bb = (verts - 0).max(0)[0]
 			min_bb = (verts - 0).min(0)[0]
 			scale = (max_bb - min_bb).max()/2 

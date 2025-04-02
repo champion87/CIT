@@ -8,6 +8,8 @@ from diffusers import DDPMScheduler, UniPCMultistepScheduler
 from src.modified_pipeline import StableSyncMVDPipeline
 from src.configs import *
 from shutil import copy
+from PIL import Image
+import numpy as np
 
 
 opt = parse_config()
@@ -110,4 +112,5 @@ result_tex_rgb, textured_views, v = syncmvd(
 	
 	)
 
-display(v)
+# Convert tensor to numpy array and save as PNG
+v.save(f"./tmp/{os.path.splitext(os.path.basename(opt.mesh))[0]}.png")

@@ -43,6 +43,10 @@ def notify_empty_queue():
     check_loop = f"while {is_queue_not_empty}; do sleep 10; echo 'Job Still Running'; done; echo 'Job finished!'"
     os.system(check_loop)
 
+def run_experiment(name):
+	python_line = f"python run_smvd.py --config experiments/{name}/config.yaml"
+	run_slurm(python_line, name)
+
 if __name__ == "__main__":
 	name = sys.argv[1]
 	# python_line = f"python src/cit_run.py --config experiments/{name}/config.yaml"

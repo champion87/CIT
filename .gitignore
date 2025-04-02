@@ -16,4 +16,4 @@ holy_shit_that_works.png
 **/*.pt
 **/experiments/*/*/*
 log/*
-results/lidor/*
+results/*

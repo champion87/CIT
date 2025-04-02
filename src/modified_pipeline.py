@@ -38,9 +38,9 @@ from .renderer.project import UVProjection as UVP
 
 
 from .syncmvd.attention import SamplewiseAttnProcessor2_0, replace_attention_processors
-from .syncmvd.prompt import prepare_prompt, prepare_negative_prompt, direction_names
+from .syncmvd.prompt import direction_names, prepare_directional_prompt, azim_prompt, azim_neg_prompt
 from .syncmvd.step import step_tex
-from .utils import encode_latents, prepare_directional_prompt, azim_prompt, azim_neg_prompt, smvd_log, get_rgb_texture, rescale_noise_cfg
+from .utils import encode_latents, smvd_log, get_rgb_texture
 
 
 
@@ -661,6 +661,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					controlnet_conditioning_scale = alpha * initial_controlnet_conditioning_scale + (1-alpha) * controlnet_conditioning_end_scale
 
 				# 2. Shuffle background colors; only black and white used after certain timestep
+				# TODO: What's going on with the backgrounds?
 				if (1-t/num_timesteps) < shuffle_background_change:
 					background_colors = [random.choice(list(color_constants.keys())) for i in range(len(self.camera_poses))]
 				elif (1-t/num_timesteps) < shuffle_background_end:
