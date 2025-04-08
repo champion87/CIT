@@ -502,18 +502,19 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				negative_prompt_embeds = [azim_neg_prompt(negative_prompt_embed_dict, pose) for pose in self.camera_poses]
 				negative_prompt_embeds = torch.stack(negative_prompt_embeds, axis=0)
 
-
+				prompt_embeds_groups = {"positive": positive_prompt_embeds}
+				result_groups = {} # for storing the results of each prompt: positive and negative
+				if do_classifier_free_guidance:
+					prompt_embeds_groups["negative"] = negative_prompt_embeds
+     
+				# DEFINE RES
+				# ITERATE OVER VIEWS
 				# expand the latents if we are doing classifier free guidance
 				latent_model_input = self.scheduler.scale_model_input(latents, t)
 
-				'''
-					Use groups to manage prompt and results
-					Make sure negative and positive prompt does not perform attention together
-				'''
-				prompt_embeds_groups = {"positive": positive_prompt_embeds}
-				result_groups = {}
-				if do_classifier_free_guidance:
-					prompt_embeds_groups["negative"] = negative_prompt_embeds
+
+
+
 
 				' Here we perform controlnet inference and unet prediction twice: once for positive and once for negative prompt for cfg '
 				for prompt_tag, prompt_embeds in prompt_embeds_groups.items():
@@ -533,7 +534,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 						encoder_hidden_states=prompt_embeds,
 						controlnet_cond=conditioning_images,
 						conditioning_scale=cond_scale,
-						guess_mode=guess_mode,
+						guess_mode=guess_mode, # False
 						return_dict=False,
 					)
 
@@ -570,11 +571,14 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				# perform guidance
 				if do_classifier_free_guidance:
 					noise_pred = result_groups["negative"] + guidance_scale * (positive_noise_pred - result_groups["negative"])
-
-
+     
 				if do_classifier_free_guidance and guidance_rescale > 0.0:
 					# Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
 					noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+
+
+
+
 
 				self.uvp.to(self._execution_device)
 				# compute the previous noisy sample x_t -> x_t-1
