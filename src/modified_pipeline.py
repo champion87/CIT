@@ -517,10 +517,6 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 				' Here we perform controlnet inference and unet prediction twice: once for positive and once for negative prompt for cfg '
 				for prompt_tag, prompt_embeds in prompt_embeds_groups.items():
-					# controlnet(s) inference
-					# control_model_input = latent_model_input
-					# controlnet_prompt_embeds = prompt_embeds
-
 
 					if isinstance(controlnet_keep[i], list):
 						cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
@@ -530,16 +526,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 							controlnet_cond_scale = controlnet_cond_scale[0]
 						cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
-					# Split into micro-batches according to group meta info
-					# Ignore this feature for now
-
-					# model_input_batches = [torch.index_select(control_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-					# prompt_embeds_batches = [torch.index_select(controlnet_prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-					# conditioning_images_batches = [torch.index_select(conditioning_images, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-
 					''' Here we perform controlnet inference. '''
-					# for model_input_batch ,prompt_embeds_batch, conditioning_images_batch \
-					# 	in zip (model_input_batches, prompt_embeds_batches, conditioning_images_batches):
 					down_block_res_samples, mid_block_res_sample = self.controlnet(
 						latent_model_input,
 						t,
@@ -549,8 +536,6 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 						guess_mode=guess_mode,
 						return_dict=False,
 					)
-					# down_block_res_samples_list.append(down_block_res_samples)
-					# mid_block_res_sample_list.append(mid_block_res_sample)
 
 					'''
 
@@ -560,16 +545,10 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					
 					'''
 					noise_pred_list = []
-					# model_input_batches = [torch.index_select(latent_model_input, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
-					# prompt_embeds_batches = [torch.index_select(prompt_embeds, dim=0, index=torch.tensor(meta[0], device=self._execution_device)) for meta in self.group_metas]
 
-					''' Here we perform unet prediction. Once for each mini-batch. '''
-					# TODO again, this runs only once.
-					# for model_input_batch, prompt_embeds_batch, down_block_res_samples_batch, mid_block_res_sample_batch, meta \
-					# 	in zip(model_input_batches, prompt_embeds_batches, down_block_res_samples_list, mid_block_res_sample_list, self.group_metas):
-     
+					''' Here we perform unet prediction. '''
 					# TODO replace attention processors with cit proccessors
-					# if t > num_timesteps * (1- ref_attention_end): # TODO why are they replacing attention proccessors here? check it out
+					# if t > num_timesteps * (1- ref_attention_end):
 					# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=1)
 					# else:
 					# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=0)
@@ -583,11 +562,6 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 						mid_block_additional_residual=mid_block_res_sample,
 						return_dict=False,
 					)[0]
-					# noise_pred_list.append(noise_pred)
-
-					# noise_pred_list = [torch.index_select(noise_pred, dim=0, index=torch.tensor(meta[1], device=self._execution_device)) for noise_pred, meta in zip(noise_pred_list, self.group_metas)]
-					# noise_pred = torch.cat(noise_pred_list, dim=0)
-					# noise_pred_list = None
 
 					result_groups[prompt_tag] = noise_pred
 
@@ -654,7 +628,6 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					controlnet_conditioning_scale = alpha * initial_controlnet_conditioning_scale + (1-alpha) * controlnet_conditioning_end_scale
 
 				# 2. Shuffle background colors; only black and white used after certain timestep
-				# TODO: What's going on with the backgrounds?
 				if (1-t/num_timesteps) < shuffle_background_change:
 					background_colors = [random.choice(list(color_constants.keys())) for i in range(len(self.camera_poses))]
 				elif (1-t/num_timesteps) < shuffle_background_end:
