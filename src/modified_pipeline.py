@@ -506,79 +506,81 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 				result_groups = {} # for storing the results of each prompt: positive and negative
 				if do_classifier_free_guidance:
 					prompt_embeds_groups["negative"] = negative_prompt_embeds
-     
-				# DEFINE RES
-				# ITERATE OVER VIEWS
-				# expand the latents if we are doing classifier free guidance
-				latent_model_input = self.scheduler.scale_model_input(latents, t)
 
-
-
-
-
-				' Here we perform controlnet inference and unet prediction twice: once for positive and once for negative prompt for cfg '
-				for prompt_tag, prompt_embeds in prompt_embeds_groups.items():
-
-					if isinstance(controlnet_keep[i], list):
-						cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
-					else:
-						controlnet_cond_scale = controlnet_conditioning_scale
-						if isinstance(controlnet_cond_scale, list):
-							controlnet_cond_scale = controlnet_cond_scale[0]
-						cond_scale = controlnet_cond_scale * controlnet_keep[i]
-
-					''' Here we perform controlnet inference. '''
-					down_block_res_samples, mid_block_res_sample = self.controlnet(
-						latent_model_input,
-						t,
-						encoder_hidden_states=prompt_embeds,
-						controlnet_cond=conditioning_images,
-						conditioning_scale=cond_scale,
-						guess_mode=guess_mode, # False
-						return_dict=False,
-					)
-
-					'''
-
-						predict the noise residual, split into mini-batches
-						Downblock res samples has n samples, we split each sample into m batches
-						and re group them into m lists of n mini batch samples.
+				noise_preds = []
+				for view in latents: # TODO what is the shape of view? what is the shape of latents?
 					
-					'''
-					noise_pred_list = []
-
-					''' Here we perform unet prediction. '''
-					# TODO replace attention processors with cit proccessors
-					# if t > num_timesteps * (1- ref_attention_end):
-					# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=1)
-					# else:
-					# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=0)
-
-					noise_pred = self.unet(
-						latent_model_input, # [10, 4, 96, 96]
-						t,
-						encoder_hidden_states=prompt_embeds,
-						cross_attention_kwargs=cross_attention_kwargs,
-						down_block_additional_residuals=down_block_res_samples,
-						mid_block_additional_residual=mid_block_res_sample,
-						return_dict=False,
-					)[0]
-
-					result_groups[prompt_tag] = noise_pred
-
-				positive_noise_pred = result_groups["positive"]
-
-				# perform guidance
-				if do_classifier_free_guidance:
-					noise_pred = result_groups["negative"] + guidance_scale * (positive_noise_pred - result_groups["negative"])
-     
-				if do_classifier_free_guidance and guidance_rescale > 0.0:
-					# Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-					noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+					# expand the latents if we are doing classifier free guidance
+					view = view.unsqueeze(0) # TODO do the unsqueeze result in the right dimension?
+					latent_model_input = self.scheduler.scale_model_input(view, t) 
 
 
 
 
+
+					' Here we perform controlnet inference and unet prediction twice: once for positive and once for negative prompt for cfg '
+					for prompt_tag, prompt_embeds in prompt_embeds_groups.items():
+
+						if isinstance(controlnet_keep[i], list):
+							cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+						else:
+							controlnet_cond_scale = controlnet_conditioning_scale
+							if isinstance(controlnet_cond_scale, list):
+								controlnet_cond_scale = controlnet_cond_scale[0]
+							cond_scale = controlnet_cond_scale * controlnet_keep[i]
+
+						''' Here we perform controlnet inference. '''
+						down_block_res_samples, mid_block_res_sample = self.controlnet(
+							latent_model_input,
+							t,
+							encoder_hidden_states=prompt_embeds,
+							controlnet_cond=conditioning_images,
+							conditioning_scale=cond_scale,
+							guess_mode=guess_mode, # False
+							return_dict=False,
+						)
+
+						'''
+
+							predict the noise residual, split into mini-batches
+							Downblock res samples has n samples, we split each sample into m batches
+							and re group them into m lists of n mini batch samples.
+						
+						'''
+						noise_pred_list = []
+
+						''' Here we perform unet prediction. '''
+						# TODO replace attention processors with cit proccessors
+						# if t > num_timesteps * (1- ref_attention_end):
+						# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=1)
+						# else:
+						# 	replace_attention_processors(self.unet, SamplewiseAttnProcessor2_0, attention_mask=meta[2], ref_attention_mask=meta[3], ref_weight=0)
+
+						noise_pred = self.unet(
+							latent_model_input, # [10, 4, 96, 96]
+							t,
+							encoder_hidden_states=prompt_embeds,
+							cross_attention_kwargs=cross_attention_kwargs,
+							down_block_additional_residuals=down_block_res_samples,
+							mid_block_additional_residual=mid_block_res_sample,
+							return_dict=False,
+						)[0]
+
+						result_groups[prompt_tag] = noise_pred
+
+					positive_noise_pred = result_groups["positive"]
+
+					# perform guidance
+					if do_classifier_free_guidance:
+						noise_pred = result_groups["negative"] + guidance_scale * (positive_noise_pred - result_groups["negative"])
+		
+					if do_classifier_free_guidance and guidance_rescale > 0.0:
+						# Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+						noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+
+					noise_preds.append(noise_pred)
+
+				views_noise_pred = torch.cat(noise_preds, dim=0)
 
 				self.uvp.to(self._execution_device)
 				# compute the previous noisy sample x_t -> x_t-1
@@ -588,7 +590,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 					step_results = step_tex(
 						scheduler=self.scheduler, 
 						uvp=self.uvp, 
-						model_output=noise_pred, 
+						model_output=views_noise_pred, 
 						timestep=t, 
 						sample=latents, 
 						texture=latent_tex,
@@ -609,7 +611,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 					intermediate_results.append((latents.to("cpu"), pred_original_sample.to("cpu")))
 				else:
-					step_results = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=True)
+					step_results = self.scheduler.step(views_noise_pred, t, latents, **extra_step_kwargs, return_dict=True)
 
 					pred_original_sample = step_results["pred_original_sample"]
 					latents = step_results["prev_sample"]
@@ -617,7 +619,7 @@ class StableSyncMVDPipeline(StableDiffusionControlNetPipeline):
 
 					intermediate_results.append((latents.to("cpu"), pred_original_sample.to("cpu")))
 
-				del noise_pred, result_groups
+				del views_noise_pred, result_groups
 					
 
 
